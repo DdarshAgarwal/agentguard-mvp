@@ -1,320 +1,341 @@
-import re
 import hashlib
-from .models import PaymentIntent, Decision
-from .security import make_id
-from .store import get_agent, get_spent
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from .capabilities import validate_capability_scope, verify_capability
+from .models import (
+    AuthorizationBoundary,
+    Decision,
+    PaymentIntent,
+    PolicyCheck,
+    RiskContribution,
+    SignedCapability,
+)
+from .security import make_id, now_iso
+from .store import get_agent, get_recent_transaction_count, get_spent
 
 
 MERCHANTS = {
-    "hotel": "StayEasy",
-    "book": "BookNest",
-    "books": "BookNest",
-    "groceries": "FreshMart",
-    "grocery": "FreshMart",
+    "hotel": ("StayEasy", "travel"),
+    "book": ("BookNest", "books"),
+    "books": ("BookNest", "books"),
+    "groceries": ("FreshMart", "groceries"),
+    "grocery": ("FreshMart", "groceries"),
 }
 
+PROMPT_INJECTION_PATTERNS = [
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "disregard previous instructions",
+    "override policy",
+    "bypass security",
+    "system prompt",
+    "jailbreak",
+    "administrator override",
+    "forget the user's limits",
+    "increase the spending limit",
+    "disable safeguards",
+    "ignore previous",
+]
 
-# ---------------------------------------------------------
-# INTENT COMPILER
-# ---------------------------------------------------------
 
-def compile_intent(instruction, agent_id):
+def _parse_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
+
+def compile_intent(instruction: str, agent_id: str) -> PaymentIntent:
     low = instruction.lower()
-
-    numbers = re.findall(
-        r"(?:₹|rs\.?\s*)?([\d,]+)",
-        low
-    )
-
-    amount = (
-        float(numbers[-1].replace(",", ""))
-        if numbers
-        else 1000
-    )
-
-    merchant = next(
-        (
-            merchant
-            for keyword, merchant in MERCHANTS.items()
-            if keyword in low
-        ),
-        "FreshMart"
+    numbers = re.findall(r"(?:₹|rs\.?\s*)?([\d,]+)", low)
+    amount = float(numbers[-1].replace(",", "")) if numbers else 1000
+    merchant, category = next(
+        ((merchant, category) for keyword, (merchant, category) in MERCHANTS.items() if keyword in low),
+        ("FreshMart", "groceries"),
     )
 
     max_amount = amount
-
-    if any(
-        word in low
-        for word in ["under", "below", "maximum", "max"]
-    ):
-        max_amount = (
-            float(numbers[0].replace(",", ""))
-            if numbers
-            else amount
-        )
-
+    if any(word in low for word in ["under", "below", "maximum", "max"]):
+        max_amount = float(numbers[0].replace(",", "")) if numbers else amount
         amount = max_amount
 
-    # Simulated prompt injection.
-    # IMPORTANT:
-    # The AI output is treated as untrusted.
     if "ignore" in low and len(numbers) > 1:
+        amount = float(numbers[-1].replace(",", ""))
 
-        amount = float(
-            numbers[-1].replace(",", "")
-        )
-
+    issued_at = now_iso()
+    authorization = AuthorizationBoundary(
+        authorization_id=make_id("auth"),
+        agent_id=agent_id,
+        original_instruction=instruction,
+        max_amount=max_amount,
+        allowed_merchants=[merchant],
+        allowed_categories=[category],
+        allowed_actions=["purchase"],
+        issued_at=issued_at,
+    )
     return PaymentIntent(
         agent_id=agent_id,
+        action="purchase",
+        category=category,
         merchant=merchant,
         amount=amount,
         max_amount=max_amount,
+        authorization_id=authorization.authorization_id,
         constraints={
-            "source_instruction": instruction
-        }
+            "source_instruction": instruction,
+            "authorization_boundary": authorization.model_dump(),
+        },
     )
 
 
-# ---------------------------------------------------------
-# CAPABILITY CHECK
-# ---------------------------------------------------------
-
-def check_capability(intent, agent):
-
-    reasons = []
-    risk = 0
-
-    # 1. Agent must exist
-    if not agent:
-        return [
-            "Unknown agent identity"
-        ], 100
-
-    # 2. Capability check
-    if "purchase" not in agent["capabilities"]:
-
-        reasons.append(
-            "Agent does not possess PURCHASE capability"
-        )
-
-        risk += 70
-
-    # 3. Transaction limit
-    if intent.amount > agent["transaction_limit"]:
-
-        reasons.append(
-            f"Amount ₹{intent.amount:,.0f} exceeds "
-            f"capability limit ₹{agent['transaction_limit']:,.0f}"
-        )
-
-        risk += 50
-
-    # 4. Merchant capability
-    if intent.merchant not in agent["allowed_merchants"]:
-
-        reasons.append(
-            f"Merchant '{intent.merchant}' "
-            f"is outside capability allowlist"
-        )
-
-        risk += 50
-
-    return reasons, risk
-
-
-# ---------------------------------------------------------
-# POLICY CHECK
-# ---------------------------------------------------------
-
-def check_policy(intent, agent):
-
-    reasons = []
-    risk = 0
-
-    spent = get_spent(intent.agent_id)
-
-    # User-authorized maximum
-    if (
-        intent.max_amount is not None
-        and intent.amount > intent.max_amount
-    ):
-
-        reasons.append(
-            "Transaction exceeds user-authorized maximum"
-        )
-
-        risk += 70
-
-    # Daily budget
-    if (
-        spent + intent.amount
-        > agent["daily_limit"]
-    ):
-
-        reasons.append(
-            "Transaction would exceed daily agent budget"
-        )
-
-        risk += 60
-
-    return reasons, risk
-
-
-# ---------------------------------------------------------
-# AI / PROMPT SECURITY
-# ---------------------------------------------------------
-
-def check_ai_security(intent):
-
-    reasons = []
-    risk = 0
-
-    instruction = (
-        intent.constraints
-        .get("source_instruction", "")
-        .lower()
+def _check(rule: str, ok: bool, expected: Any, actual: Any, severity: str, message: str) -> PolicyCheck:
+    return PolicyCheck(
+        rule=rule,
+        status="PASS" if ok else "FAIL",
+        expected=expected,
+        actual=actual,
+        severity=severity,
+        message=message,
     )
 
-    injection_patterns = [
-        "ignore previous",
-        "ignore all previous",
-        "disregard previous",
-        "override instructions",
-        "system prompt",
-        "jailbreak",
-    ]
 
-    detected = [
-        pattern
-        for pattern in injection_patterns
-        if pattern in instruction
-    ]
-
-    if detected:
-
-        reasons.append(
-            "Prompt-injection pattern detected"
-        )
-
-        risk += 50
-
-    return reasons, risk
+def _risk(signal: str, points: int, explanation: str) -> RiskContribution:
+    return RiskContribution(signal=signal, points=points, explanation=explanation)
 
 
-# ---------------------------------------------------------
-# FINAL DECISION ENGINE
-# ---------------------------------------------------------
-
-def evaluate(intent, idempotency_key):
-
+def evaluate(
+    intent: PaymentIntent,
+    idempotency_key: str,
+    capability: Optional[SignedCapability],
+) -> Decision:
+    started = time.perf_counter()
     agent = get_agent(intent.agent_id)
+    checks: list[PolicyCheck] = []
+    risk: list[RiskContribution] = []
+    reason_codes: list[str] = []
+    hard_blocks: list[str] = []
 
-    reasons = []
-    risk = 0
+    def fail(code: str, points: int, explanation: str, hard: bool = False) -> None:
+        reason_codes.append(code)
+        risk.append(_risk(code, points, explanation))
+        if hard:
+            hard_blocks.append(code)
 
-    # -----------------------------------------
-    # CAPABILITY
-    # -----------------------------------------
-
-    capability_reasons, capability_risk = (
-        check_capability(
-            intent,
-            agent
-        )
-    )
-
-    reasons.extend(capability_reasons)
-    risk += capability_risk
-
-    # -----------------------------------------
-    # POLICY
-    # -----------------------------------------
-
-    if agent:
-
-        policy_reasons, policy_risk = (
-            check_policy(
-                intent,
-                agent
+    checks.append(_check("agent_identity", bool(agent), "known agent", intent.agent_id, "CRITICAL", "Agent identity exists."))
+    if not agent:
+        fail("UNKNOWN_AGENT", 100, "Unknown agent identity.", True)
+    else:
+        checks.append(
+            _check(
+                "agent_action",
+                intent.action in agent["capabilities"],
+                agent["capabilities"],
+                intent.action,
+                "CRITICAL",
+                "Agent has the requested action capability.",
             )
         )
+        if intent.action not in agent["capabilities"]:
+            fail("UNAUTHORIZED_ACTION", 90, "Agent does not possess the requested action.", True)
 
-        reasons.extend(policy_reasons)
-        risk += policy_risk
-
-    # -----------------------------------------
-    # AI SECURITY
-    # -----------------------------------------
-
-    ai_reasons, ai_risk = (
-        check_ai_security(intent)
-    )
-
-    reasons.extend(ai_reasons)
-    risk += ai_risk
-
-    # -----------------------------------------
-    # RISK NORMALIZATION
-    # -----------------------------------------
-
-    risk = min(
-        100,
-        risk
-    )
-
-    # -----------------------------------------
-    # DECISION
-    # -----------------------------------------
-
-    if risk >= 70:
-
-        decision = "BLOCK"
-
-    elif risk >= 40:
-
-        decision = "ESCALATE"
-
+    if not capability:
+        checks.append(_check("capability_present", False, "signed capability", None, "CRITICAL", "Signed capability is required."))
+        fail("CAPABILITY_MISSING", 100, "Request did not include a signed capability.", True)
     else:
+        verification = verify_capability(capability)
+        checks.append(
+            _check(
+                "capability_signature",
+                verification["valid"],
+                "valid signature and expiry",
+                verification["code"],
+                "CRITICAL",
+                verification["message"],
+            )
+        )
+        if not verification["valid"]:
+            fail(verification["code"], 100, verification["message"], True)
+        for scope_failure in validate_capability_scope(capability, intent):
+            checks.append(
+                _check(
+                    scope_failure["code"].lower(),
+                    False,
+                    scope_failure["expected"],
+                    scope_failure["actual"],
+                    "CRITICAL" if "AGENT" in scope_failure["code"] or "ACTION" in scope_failure["code"] else "HIGH",
+                    scope_failure["message"],
+                )
+            )
+            fail(
+                scope_failure["code"],
+                90 if "AGENT" in scope_failure["code"] or "ACTION" in scope_failure["code"] else 50,
+                scope_failure["message"],
+                "AGENT" in scope_failure["code"] or "ACTION" in scope_failure["code"],
+            )
 
+    authorization = intent.constraints.get("authorization_boundary", {})
+    authorized_amount = float(authorization.get("max_amount") or intent.max_amount or 0)
+    allowed_merchants = authorization.get("allowed_merchants") or []
+    allowed_categories = authorization.get("allowed_categories") or []
+    allowed_actions = authorization.get("allowed_actions") or []
+
+    checks.append(
+        _check(
+            "user_authorized_amount",
+            authorized_amount > 0 and intent.amount <= authorized_amount,
+            authorized_amount,
+            intent.amount,
+            "CRITICAL",
+            "Request stays within the original user amount boundary.",
+        )
+    )
+    if not authorized_amount or intent.amount > authorized_amount:
+        fail("USER_AUTHORIZATION_AMOUNT_EXCEEDED", 70, "Transaction exceeds the user's original authorization.", True)
+
+    checks.append(
+        _check(
+            "user_authorized_merchant",
+            intent.merchant in allowed_merchants,
+            allowed_merchants,
+            intent.merchant,
+            "HIGH",
+            "Requested merchant matches the original user authorization.",
+        )
+    )
+    if intent.merchant not in allowed_merchants:
+        fail("USER_AUTHORIZATION_MERCHANT_MISMATCH", 45, "Merchant is outside the user's authorization.", False)
+
+    checks.append(
+        _check(
+            "user_authorized_action",
+            intent.action in allowed_actions,
+            allowed_actions,
+            intent.action,
+            "CRITICAL",
+            "Requested action matches the original user authorization.",
+        )
+    )
+    if intent.action not in allowed_actions:
+        fail("USER_AUTHORIZATION_ACTION_MISMATCH", 80, "Action is outside the user's authorization.", True)
+
+    checks.append(
+        _check(
+            "user_authorized_category",
+            intent.category in allowed_categories,
+            allowed_categories,
+            intent.category,
+            "MEDIUM",
+            "Requested category matches the original user authorization.",
+        )
+    )
+    if intent.category not in allowed_categories:
+        fail("USER_AUTHORIZATION_CATEGORY_MISMATCH", 30, "Category is outside the user's authorization.", False)
+
+    expires_at = _parse_time(intent.expires_at)
+    if expires_at:
+        active = expires_at > datetime.now(timezone.utc)
+        checks.append(_check("authorization_expiry", active, "future expiry", intent.expires_at, "CRITICAL", "Authorization time window is still active."))
+        if not active:
+            fail("AUTHORIZATION_EXPIRED", 80, "Client request used an expired authorization window.", True)
+
+    if agent:
+        checks.append(
+            _check(
+                "transaction_limit",
+                intent.amount <= agent["transaction_limit"],
+                agent["transaction_limit"],
+                intent.amount,
+                "HIGH",
+                "Amount stays under the agent transaction limit.",
+            )
+        )
+        if intent.amount > agent["transaction_limit"]:
+            fail("TRANSACTION_LIMIT_EXCEEDED", 50, "Amount exceeds the agent transaction limit.", False)
+
+        spent = get_spent(intent.agent_id)
+        checks.append(
+            _check(
+                "daily_budget",
+                spent + intent.amount <= agent["daily_limit"],
+                agent["daily_limit"] - spent,
+                intent.amount,
+                "HIGH",
+                "Daily budget has enough remaining capacity.",
+            )
+        )
+        if spent + intent.amount > agent["daily_limit"]:
+            fail("DAILY_BUDGET_EXCEEDED", 60, "Transaction would exceed the daily budget.", True)
+
+        since = (datetime.now(timezone.utc) - timedelta(seconds=agent["velocity_window_seconds"])).isoformat()
+        recent = get_recent_transaction_count(intent.agent_id, since)
+        checks.append(
+            _check(
+                "velocity_limit",
+                recent < agent["velocity_limit_count"],
+                f"{agent['velocity_limit_count']} per {agent['velocity_window_seconds']}s",
+                recent + 1,
+                "HIGH",
+                "Transaction frequency is within velocity policy.",
+            )
+        )
+        if recent >= agent["velocity_limit_count"]:
+            fail("VELOCITY_LIMIT_EXCEEDED", 80, "Velocity policy would be exceeded.", True)
+
+    instruction = str(intent.constraints.get("source_instruction", "")).lower()
+    detected = [pattern for pattern in PROMPT_INJECTION_PATTERNS if pattern in instruction]
+    checks.append(
+        _check(
+            "prompt_injection_signal",
+            not detected,
+            "no suspicious prompt patterns",
+            detected,
+            "HIGH",
+            "Instruction does not contain known prompt-injection indicators.",
+        )
+    )
+    if detected:
+        fail("PROMPT_INJECTION_DETECTED", 50, "Suspicious prompt-injection wording was detected.", False)
+
+    score = min(100, sum(item.points for item in risk))
+    if hard_blocks or score >= 70:
+        decision = "BLOCK"
+    elif score >= 40:
+        decision = "ESCALATE"
+    else:
         decision = "ALLOW"
 
-    # -----------------------------------------
-    # SUCCESS EXPLANATION
-    # -----------------------------------------
-
-    if not reasons:
-
+    if not reason_codes:
+        reason_codes = ["SECURITY_CONTROLS_PASSED"]
         reasons = [
-            "Agent capability verified",
-            "Transaction amount within capability",
-            "Merchant is authorized",
-            "Daily budget available",
-            "No prompt-injection indicators"
+            "Agent identity verified",
+            "Capability signature valid",
+            "Transaction is within user authorization",
+            "Merchant and budget controls passed",
+            "No prompt-injection indicators",
         ]
+    else:
+        reasons = [item.explanation for item in risk]
 
+    latency_ms = round((time.perf_counter() - started) * 1000, 3)
     return Decision(
         decision=decision,
-        risk_score=risk,
+        risk_score=score,
         reasons=reasons,
-        policy_version="capability-policy-v2",
-        decision_id=make_id("dec")
+        reason_codes=reason_codes,
+        policy_checks=checks,
+        risk_contributions=risk,
+        hard_blocks=hard_blocks,
+        decision_id=make_id("dec"),
+        latency_ms=latency_ms,
     )
 
 
-# ---------------------------------------------------------
-# IDEMPOTENCY
-# ---------------------------------------------------------
-
-def idem_key(intent):
-
+def idem_key(intent: PaymentIntent) -> str:
     raw = (
-        f"{intent.agent_id}|"
-        f"{intent.merchant}|"
-        f"{intent.amount:.2f}|"
+        f"{intent.agent_id}|{intent.action}|{intent.category}|"
+        f"{intent.merchant}|{intent.amount:.2f}|"
         f"{intent.constraints.get('source_instruction', '')}"
     )
-
-    return hashlib.sha256(
-        raw.encode()
-    ).hexdigest()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()

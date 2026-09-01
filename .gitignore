@@ -1,6 +1,10 @@
 backend/.venv/
 backend/__pycache__/
 backend/*.db
+backend/.agentguard_secret
 frontend/node_modules/
 frontend/dist/
 .env
+*.log
+*.pem
+*.key
