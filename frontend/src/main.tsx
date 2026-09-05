@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
-const API = (import.meta.env.VITE_API_URL || "http://localhost:8000/api").replace(/\/$/, "");
+const API = (import.meta.env.VITE_API_URL || "/api").replace(/\/$/, "");
+const API_FALLBACK = "http://127.0.0.1:8000/api";
 const AGENT_ID = "shopping-agent-01";
 
 const ATTACKS = [
@@ -30,22 +31,62 @@ function safeTime(value: string | undefined) {
 }
 
 async function api(path: string, options: RequestInit = {}) {
-  const response = await fetch(`${API}${path}`, {
-    ...options,
-    headers: { "Content-Type": "application/json", Accept: "application/json", ...(options.headers || {}) },
-  });
+  const request = async (base: string) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8000);
 
-  if (!response.ok) {
-    let message = `Security gateway request failed (${response.status}).`;
     try {
-      const body = await response.json();
-      if (typeof body?.detail === "string") message = body.detail;
-    } catch {
-      // Keep the UI error generic instead of surfacing server internals.
+      const response = await fetch(`${base}${path}`, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          ...(options.headers || {}),
+        },
+      });
+
+      if (!response.ok) {
+        let message = `Security gateway request failed (${response.status}).`;
+        try {
+          const body = await response.json();
+          if (typeof body?.detail === "string") message = body.detail;
+        } catch {
+          // Never surface raw server internals.
+        }
+        throw new Error(message);
+      }
+
+      return response.json();
+    } finally {
+      window.clearTimeout(timeout);
     }
-    throw new Error(message);
+  };
+
+  try {
+    return await request(API);
+  } catch (firstError) {
+    // Local development fallback: if the Vite proxy is unavailable,
+    // talk directly to FastAPI on IPv4. This avoids localhost/IPv6 issues.
+    if (!import.meta.env.VITE_API_URL && API === "/api") {
+      try {
+        return await request(API_FALLBACK);
+      } catch {
+        // Fall through to a useful connection error.
+      }
+    }
+
+    const detail =
+      firstError instanceof DOMException && firstError.name === "AbortError"
+        ? "AgentGuard API timed out. Make sure the FastAPI server is running on port 8000."
+        : firstError instanceof TypeError
+          ? "Cannot reach the AgentGuard API. Start FastAPI on port 8000 and refresh."
+          : firstError instanceof Error
+            ? firstError.message
+            : "AgentGuard API request failed.";
+
+    throw new Error(detail);
   }
-  return response.json();
 }
 
 function BoundaryList({ checks = [] }: { checks: any[] }) {
@@ -206,10 +247,37 @@ function App() {
   const [error, setError] = useState("");
 
   async function refresh() {
-    const [nextMetrics, nextAudit, nextPolicy] = await Promise.all([api("/metrics"), api("/audit"), api(`/settings/${AGENT_ID}`)]);
-    setMetrics(nextMetrics);
-    setAuditRows(nextAudit);
-    setPolicy(nextPolicy);
+    const [metricsResult, auditResult, policyResult] = await Promise.allSettled([
+      api("/metrics"),
+      api("/audit"),
+      api(`/settings/${AGENT_ID}`),
+    ]);
+
+    const failures: string[] = [];
+
+    if (metricsResult.status === "fulfilled") {
+      setMetrics(metricsResult.value);
+    } else {
+      failures.push("metrics");
+    }
+
+    if (auditResult.status === "fulfilled") {
+      setAuditRows(auditResult.value);
+    } else {
+      failures.push("audit");
+    }
+
+    if (policyResult.status === "fulfilled") {
+      setPolicy(policyResult.value);
+    } else {
+      failures.push("spending policy");
+    }
+
+    if (failures.length) {
+      throw new Error(
+        `AgentGuard API unavailable for ${failures.join(", ")}. Make sure FastAPI is running on port 8000.`,
+      );
+    }
   }
 
   async function run(label: string, fn: () => Promise<void>) {
@@ -255,7 +323,19 @@ function App() {
     });
   }
 
-  useEffect(() => { refresh().catch((err) => setError(err.message)); }, []);
+  useEffect(() => {
+    let mounted = true;
+
+    refresh().catch((err) => {
+      if (mounted) {
+        setError(err instanceof Error ? err.message : "Unable to connect to AgentGuard.");
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const demoSteps = useMemo(() => ["Set policy", "Legitimate transaction", "Attack Lab", "Security benchmark", "Verify audit"], []);
   const prevented = money(metrics.unauthorized_money_prevented);
