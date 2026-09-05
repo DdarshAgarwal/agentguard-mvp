@@ -151,3 +151,24 @@ def test_malformed_request_is_rejected(client):
         },
     )
     assert response.status_code == 422
+
+
+def test_user_policy_changes_are_enforced_server_side(client):
+    response = client.put(
+        "/api/settings/shopping-agent-01",
+        json={"daily_limit": 6000, "transaction_limit": 2000, "velocity_limit_count": 3, "velocity_window_seconds": 60},
+    )
+    assert response.status_code == 200
+    data = compiled(client, "Buy groceries under ₹3000")
+    assert data["capability"]["payload"]["max_transaction_amount"] == 2000
+    result = submit(client, data["intent"], data["capability"], "policy-enforce-01")
+    assert result["decision"]["decision"] == "BLOCK"
+    assert "CAPABILITY_AMOUNT_EXCEEDED" in result["decision"]["reason_codes"]
+
+
+def test_atomic_transaction_limit_is_final_server_boundary(client):
+    data = compiled(client, "Buy groceries under ₹3000")
+    data["intent"]["amount"] = 5001
+    result = submit(client, data["intent"], data["capability"], "atomic-limit-01")
+    assert result["decision"]["decision"] == "BLOCK"
+    assert get_spent("shopping-agent-01") == 0

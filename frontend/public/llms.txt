@@ -1,0 +1,15 @@
+# AgentGuard
+
+AgentGuard is a zero-trust control plane for autonomous financial agents.
+
+## Core behavior
+- Treat AI-generated payment intent as untrusted input.
+- Issue short-lived HMAC-SHA256 signed capabilities.
+- Enforce user-configured daily and per-transaction spending limits server-side.
+- Enforce merchant, category, action, expiry, velocity and replay controls.
+- Use atomic SQLite transactions for final budget reservation and payment insertion.
+- Record decisions and payments in a tamper-evident audit hash chain.
+- Provide an Attack Lab and security benchmark for adversarial demonstrations.
+
+## Demo
+The local dashboard uses simulated payments only. No real financial transaction is performed.

@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,27 +39,41 @@ from .store import (
     upsert_agent,
     verify_audit_chain,
 )
+from .models import SpendingPolicyRequest
+from .store import update_spending_policy
 
 
-app = FastAPI(title="AgentGuard API", version="1.0.0")
+app = FastAPI(
+    title="AgentGuard API",
+    version="1.0.0",
+    docs_url="/docs" if os.getenv("AGENTGUARD_DOCS", "false").lower() == "true" else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if os.getenv("AGENTGUARD_DOCS", "false").lower() == "true" else None,
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[origin.strip() for origin in os.getenv("AGENTGUARD_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    body_size = int(request.headers.get("content-length") or 0)
+    try:
+        body_size = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        body_size = 64_001
     if body_size > 64_000:
         raise HTTPException(413, "Request body too large")
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -95,31 +110,31 @@ def _decision_from_replay(tx: dict[str, Any]) -> Decision:
     )
 
 
-def _decision_with_atomic_budget_block(decision: Decision, atomic: dict[str, Any]) -> Decision:
+def _decision_with_atomic_block(decision: Decision, atomic: dict[str, Any]) -> Decision:
     return decision.model_copy(
         update={
             "decision": "BLOCK",
             "risk_score": 100,
-            "reasons": decision.reasons + ["Atomic budget reservation rejected the payment."],
-            "reason_codes": decision.reason_codes + ["ATOMIC_BUDGET_EXCEEDED"],
-            "hard_blocks": decision.hard_blocks + ["ATOMIC_BUDGET_EXCEEDED"],
+            "reasons": decision.reasons + [f"Atomic server policy rejected the payment: {atomic.get('reason', 'POLICY_BLOCK')} ."],
+            "reason_codes": decision.reason_codes + [str(atomic.get("reason", "ATOMIC_POLICY_BLOCKED"))],
+            "hard_blocks": decision.hard_blocks + [str(atomic.get("reason", "ATOMIC_POLICY_BLOCKED"))],
             "policy_checks": decision.policy_checks
             + [
                 PolicyCheck(
-                    rule="atomic_budget_reservation",
+                    rule="atomic_server_policy",
                     status="FAIL",
-                    expected=atomic.get("daily_limit"),
-                    actual=atomic.get("spent_before"),
+                    expected=atomic.get("daily_limit") or atomic.get("transaction_limit") or atomic.get("velocity_limit_count"),
+                    actual=atomic.get("spent_before") or atomic.get("attempted_amount") or atomic.get("recent_transactions"),
                     severity="CRITICAL",
-                    message="Budget check and payment insertion were enforced in one SQLite transaction.",
+                    message="Final policy enforcement, replay protection and payment insertion were enforced in one SQLite transaction.",
                 )
             ],
             "risk_contributions": decision.risk_contributions
             + [
                 RiskContribution(
-                    signal="ATOMIC_BUDGET_EXCEEDED",
+                    signal=str(atomic.get("reason", "ATOMIC_POLICY_BLOCKED")),
                     points=100,
-                    explanation="Atomic reservation prevented daily budget overspend.",
+                    explanation="Atomic server-side enforcement prevented an unsafe payment.",
                 )
             ],
         }
@@ -200,9 +215,9 @@ def process_transaction(req: TransactionRequest, attack_run_id: str | None = Non
         replay_decision = _decision_from_replay(atomic["transaction"])
         return {"replayed": True, "decision": replay_decision.model_dump(), "transaction": atomic["transaction"]}
     if atomic["status"] == "BLOCKED":
-        blocked = _decision_with_atomic_budget_block(decision, atomic)
+        blocked = _decision_with_atomic_block(decision, atomic)
         audit(
-            "PAYMENT_BLOCKED_ATOMIC_BUDGET",
+            "PAYMENT_BLOCKED_ATOMIC_POLICY",
             req.intent.agent_id,
             atomic,
             decision=blocked.decision,
@@ -284,9 +299,9 @@ def payment_execute(req: TransactionRequest):
     return process_transaction(req)
 
 
-def _run_attack(attack_name: str, persist: bool = True) -> AttackRun:
+def _run_attack(attack_name: str, persist: bool = True, reset_attack_runs: bool = True) -> AttackRun:
     started = time.perf_counter()
-    reset_demo()
+    reset_demo(clear_attack_runs=reset_attack_runs)
     name = attack_name.replace("-", " ").title()
     expected = "Backend deterministic controls block the unauthorized financial action."
     payload: dict[str, Any] = {}
@@ -439,7 +454,7 @@ def benchmark_run():
         "unauthorized-action",
         "budget-exhaustion",
     ]
-    runs = [_run_attack(name, persist=True).model_dump() for name in scenarios]
+    runs = [_run_attack(name, persist=True, reset_attack_runs=False).model_dump() for name in scenarios]
     blocked = sum(1 for run in runs if run["blocked"])
     unauthorized = sum(float(run["unauthorized_executed"]) for run in runs)
     attempted = sum(float(run["attempted_amount"]) for run in runs)
@@ -508,3 +523,108 @@ def metrics():
 def demo_reset():
     reset_demo()
     return {"status": "RESET_COMPLETE", "agent_id": "shopping-agent-01"}
+
+@app.get("/api/settings/{agent_id}")
+def get_spending_settings(agent_id: str):
+
+    agent = get_agent(agent_id)
+
+    if not agent:
+        raise HTTPException(
+            status_code=404,
+            detail="Agent not found",
+        )
+
+    daily_limit = float(agent["daily_limit"])
+    spent = float(agent["spent_today"])
+
+    return {
+        "agent_id": agent["id"],
+        "name": agent["name"],
+        "daily_limit": daily_limit,
+        "transaction_limit": float(agent["transaction_limit"]),
+        "spent_today": spent,
+        "remaining_today": max(0, daily_limit - spent),
+        "daily_utilization_percent": round(
+            (spent / daily_limit * 100)
+            if daily_limit > 0
+            else 0,
+            1,
+        ),
+        "policy_version": int(
+            agent.get("policy_version", 1)
+        ),
+        "velocity_limit_count": int(
+            agent["velocity_limit_count"]
+        ),
+        "velocity_window_seconds": int(
+            agent["velocity_window_seconds"]
+        ),
+        "allowed_merchants": agent["allowed_merchants"],
+        "allowed_categories": agent["allowed_categories"],
+    }
+
+@app.put("/api/settings/{agent_id}")
+def update_settings(
+    agent_id: str,
+    req: SpendingPolicyRequest,
+):
+
+    try:
+        agent = update_spending_policy(
+            agent_id=agent_id,
+            daily_limit=req.daily_limit,
+            transaction_limit=req.transaction_limit,
+            velocity_limit_count=req.velocity_limit_count,
+            velocity_window_seconds=req.velocity_window_seconds,
+        )
+
+    except ValueError as exc:
+
+        code = str(exc)
+
+        if code == "UNKNOWN_AGENT":
+            raise HTTPException(
+                status_code=404,
+                detail=code,
+            )
+
+        raise HTTPException(
+            status_code=400,
+            detail=code,
+        )
+
+    spent = float(agent["spent_today"])
+    daily = float(agent["daily_limit"])
+
+    return {
+        "success": True,
+        "message": "Spending policy updated.",
+        "policy": {
+            "agent_id": agent["id"],
+            "daily_limit": daily,
+            "transaction_limit": float(
+                agent["transaction_limit"]
+            ),
+            "spent_today": spent,
+            "remaining_today": max(
+                0,
+                daily - spent,
+            ),
+            "daily_utilization_percent": round(
+                spent / daily * 100
+                if daily > 0
+                else 0,
+                1,
+            ),
+            "policy_version": int(
+                agent.get("policy_version", 1)
+            ),
+            "velocity_limit_count": int(
+                agent["velocity_limit_count"]
+            ),
+            "velocity_window_seconds": int(
+                agent["velocity_window_seconds"]
+            ),
+        },
+    }        

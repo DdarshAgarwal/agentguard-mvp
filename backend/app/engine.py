@@ -252,7 +252,7 @@ def evaluate(
             )
         )
         if intent.amount > agent["transaction_limit"]:
-            fail("TRANSACTION_LIMIT_EXCEEDED", 50, "Amount exceeds the agent transaction limit.", False)
+            fail("TRANSACTION_LIMIT_EXCEEDED", 100, "Amount exceeds the server-enforced transaction limit.", True)
 
         spent = get_spent(intent.agent_id)
         checks.append(
@@ -296,7 +296,7 @@ def evaluate(
         )
     )
     if detected:
-        fail("PROMPT_INJECTION_DETECTED", 50, "Suspicious prompt-injection wording was detected.", False)
+        fail("PROMPT_INJECTION_DETECTED", 100, "Suspicious prompt-injection wording was detected.", True)
 
     score = min(100, sum(item.points for item in risk))
     if hard_blocks or score >= 70:
